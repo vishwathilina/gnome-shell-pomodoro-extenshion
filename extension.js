@@ -22,6 +22,10 @@ const PomodoroIndicator = GObject.registerClass(
         GLib.get_user_cache_dir(),
         "pomodoro-state.json",
       ]);
+      this._statsFile = GLib.build_filenamev([
+        GLib.get_user_cache_dir(),
+        "pomodoro-stats.json",
+      ]);
 
       this._workTime = this._settings.get_int("work-time");
       this._shortBreak = this._settings.get_int("short-break-time");
@@ -35,6 +39,15 @@ const PomodoroIndicator = GObject.registerClass(
       this._pomodoroCount = 0;
       this._timeout = null;
       this._signalIds = [];
+      
+      // Track work session start time for real focus time recording
+      this._workSessionStartTime = null;
+      
+      // Statistics view mode: 'week' or 'month'
+      this._statsViewMode = 'week';
+      
+      // Load statistics
+      this._focusStats = this._loadStats();
 
       // Restore state if exists
       this._restoreState();
@@ -53,6 +66,111 @@ const PomodoroIndicator = GObject.registerClass(
       this._onSettingsChanged = this._settings.connect("changed", () =>
         this._updateSettings()
       );
+    }
+    
+    _loadStats() {
+      try {
+        const file = Gio.File.new_for_path(this._statsFile);
+        if (!file.query_exists(null)) {
+          return {};
+        }
+        const [success, contents] = file.load_contents(null);
+        if (!success) return {};
+        return JSON.parse(new TextDecoder().decode(contents));
+      } catch (e) {
+        console.error(`[Pomodoro] Error loading stats: ${e.message}`);
+        return {};
+      }
+    }
+    
+    _saveStats() {
+      try {
+        const file = Gio.File.new_for_path(this._statsFile);
+        file.replace_contents(
+          JSON.stringify(this._focusStats),
+          null,
+          false,
+          Gio.FileCreateFlags.REPLACE_DESTINATION,
+          null
+        );
+      } catch (e) {
+        console.error(`[Pomodoro] Error saving stats: ${e.message}`);
+      }
+    }
+    
+    _getTodayKey() {
+      const now = new Date();
+      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    }
+    
+    _recordFocusTime(seconds) {
+      const today = this._getTodayKey();
+      if (!this._focusStats[today]) {
+        this._focusStats[today] = 0;
+      }
+      this._focusStats[today] += seconds;
+      this._saveStats();
+      this._updateStatsUI();
+    }
+    
+    _getTodayFocusTime() {
+      const today = this._getTodayKey();
+      return this._focusStats[today] || 0;
+    }
+    
+    _getTodayFocusTimeWithCurrent() {
+      let total = this._getTodayFocusTime();
+      // Add current running work session time
+      if (this._isWorkTime && this._workSessionStartTime && this._isRunning) {
+        const currentSessionSeconds = Math.floor((Date.now() - this._workSessionStartTime) / 1000);
+        total += currentSessionSeconds;
+      }
+      return total;
+    }
+    
+    _getWeekData() {
+      const data = [];
+      const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const now = new Date();
+      
+      for (let i = 6; i >= 0; i--) {
+        const date = new Date(now);
+        date.setDate(date.getDate() - i);
+        const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        data.push({
+          label: dayNames[date.getDay()],
+          value: this._focusStats[key] || 0,
+          isToday: i === 0
+        });
+      }
+      return data;
+    }
+    
+    _getMonthData() {
+      const data = [];
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = now.getMonth();
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      
+      for (let day = 1; day <= daysInMonth; day++) {
+        const key = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        data.push({
+          label: day.toString(),
+          value: this._focusStats[key] || 0,
+          isToday: day === now.getDate()
+        });
+      }
+      return data;
+    }
+    
+    _formatFocusTime(seconds) {
+      const hours = Math.floor(seconds / 3600);
+      const mins = Math.floor((seconds % 3600) / 60);
+      if (hours > 0) {
+        return `${hours}h ${mins}m`;
+      }
+      return `${mins}m`;
     }
 
     _saveState() {
@@ -299,8 +417,210 @@ const PomodoroIndicator = GObject.registerClass(
       });
       this.menu.addMenuItem(this._nextStepItem);
 
+      // Statistics section
+      this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+      this._buildStatsUI();
+
       // Update UI after restoration
       this._updateUIAfterRestore();
+    }
+    
+    _buildStatsUI() {
+      // Stats container
+      this._statsItem = new PopupMenu.PopupMenuItem("", {
+        reactive: false,
+      });
+      
+      const statsBox = new St.BoxLayout({
+        vertical: true,
+        style: "padding: 4px 6px; spacing: 8px;",
+      });
+      
+      // Today's focus time header
+      const todayBox = new St.BoxLayout({
+        vertical: false,
+        style: "spacing: 8px;",
+      });
+      
+      const todayLabel = new St.Label({
+        text: "Today's Focus:",
+        style: "font-size: 13px; color: #ddd; font-weight: bold;",
+        x_expand: true,
+      });
+      
+      this._todayTimeLabel = new St.Label({
+        text: this._formatFocusTime(this._getTodayFocusTime()),
+        style: "font-size: 13px; color: #4CAF50; font-weight: bold;",
+      });
+      
+      todayBox.add_child(todayLabel);
+      todayBox.add_child(this._todayTimeLabel);
+      statsBox.add_child(todayBox);
+      
+      // Week/Month toggle buttons
+      const toggleBox = new St.BoxLayout({
+        vertical: false,
+        style: "spacing: 4px; margin-bottom: 4px;",
+      });
+      
+      this._weekBtn = new St.Button({
+        label: "Week",
+        style_class: "button",
+        style: "padding: 4px 12px; border-radius: 4px; background-color: #4CAF50; color: white; font-size: 11px;",
+      });
+      
+      this._monthBtn = new St.Button({
+        label: "Month",
+        style_class: "button",
+        style: "padding: 4px 12px; border-radius: 4px; background-color: #555; color: #ccc; font-size: 11px;",
+      });
+      
+      this._weekBtn.connect("clicked", () => {
+        this._statsViewMode = 'week';
+        this._weekBtn.set_style("padding: 4px 12px; border-radius: 4px; background-color: #4CAF50; color: white; font-size: 11px;");
+        this._monthBtn.set_style("padding: 4px 12px; border-radius: 4px; background-color: #555; color: #ccc; font-size: 11px;");
+        this._updateChart();
+      });
+      
+      this._monthBtn.connect("clicked", () => {
+        this._statsViewMode = 'month';
+        this._monthBtn.set_style("padding: 4px 12px; border-radius: 4px; background-color: #4CAF50; color: white; font-size: 11px;");
+        this._weekBtn.set_style("padding: 4px 12px; border-radius: 4px; background-color: #555; color: #ccc; font-size: 11px;");
+        this._updateChart();
+      });
+      
+      toggleBox.add_child(this._weekBtn);
+      toggleBox.add_child(this._monthBtn);
+      statsBox.add_child(toggleBox);
+      
+      // Chart area
+      this._chartArea = new St.DrawingArea({
+        width: 200,
+        height: 80,
+        style_class: "chart-area",
+      });
+      
+      this._chartArea.connect("repaint", () => this._drawChart());
+      statsBox.add_child(this._chartArea);
+      
+      // Chart labels
+      this._chartLabelsBox = new St.BoxLayout({
+        vertical: false,
+        style: "spacing: 0px;",
+      });
+      statsBox.add_child(this._chartLabelsBox);
+      
+      this._statsItem.actor.add_child(statsBox);
+      this.menu.addMenuItem(this._statsItem);
+      
+      this._updateChart();
+    }
+    
+    _updateChart() {
+      if (this._chartArea) {
+        this._chartArea.queue_repaint();
+      }
+      this._updateChartLabels();
+    }
+    
+    _updateChartLabels() {
+      // Clear existing labels
+      this._chartLabelsBox.destroy_all_children();
+      
+      const data = this._statsViewMode === 'week' ? this._getWeekData() : this._getMonthData();
+      const barWidth = this._statsViewMode === 'week' ? 24 : 6;
+      const spacing = this._statsViewMode === 'week' ? 4 : 1;
+      
+      if (this._statsViewMode === 'week') {
+        // Show all day labels for week view
+        data.forEach((item) => {
+          const label = new St.Label({
+            text: item.label,
+            style: `font-size: 9px; color: ${item.isToday ? '#4CAF50' : '#888'}; width: ${barWidth + spacing}px; text-align: center;`,
+            x_align: Clutter.ActorAlign.CENTER,
+          });
+          this._chartLabelsBox.add_child(label);
+        });
+      } else {
+        // For month view, create a label for each bar position
+        // Only show text for every 5th day and today, but keep spacing consistent
+        data.forEach((item, index) => {
+          const showLabel = (index + 1) % 5 === 0 || index === 0 || item.isToday;
+          const label = new St.Label({
+            text: showLabel ? item.label : '',
+            style: `font-size: 7px; color: ${item.isToday ? '#4CAF50' : '#888'}; width: ${barWidth + spacing}px; text-align: center;`,
+            x_align: Clutter.ActorAlign.CENTER,
+          });
+          this._chartLabelsBox.add_child(label);
+        });
+      }
+    }
+    
+    _drawChart() {
+      const cr = this._chartArea.get_context();
+      const [width, height] = this._chartArea.get_surface_size();
+      
+      const data = this._statsViewMode === 'week' ? this._getWeekData() : this._getMonthData();
+      const maxValue = Math.max(...data.map(d => d.value), 1); // At least 1 to avoid division by zero
+      
+      const barWidth = this._statsViewMode === 'week' ? 24 : 6;
+      const spacing = this._statsViewMode === 'week' ? 4 : 1;
+      const chartHeight = height - 5;
+      
+      // Get accent color
+      let r = 0.3, g = 0.69, b = 0.31; // fallback green #4CAF50
+      try {
+        const theme = St.ThemeContext.get_for_stage(global.stage);
+        const [ok, accent] = theme.lookup_color("accent_color");
+        if (ok && accent) {
+          r = accent.red;
+          g = accent.green;
+          b = accent.blue;
+        }
+      } catch (e) {
+        // Use fallback
+      }
+      
+      // Draw bars
+      let x = 2;
+      data.forEach((item) => {
+        const barHeight = (item.value / maxValue) * chartHeight;
+        const y = chartHeight - barHeight;
+        
+        // Bar background
+        cr.setSourceRGBA(0.3, 0.3, 0.3, 0.5);
+        cr.rectangle(x, 0, barWidth, chartHeight);
+        cr.fill();
+        
+        // Bar fill
+        if (item.isToday) {
+          cr.setSourceRGBA(r, g, b, 1);
+        } else {
+          cr.setSourceRGBA(r, g, b, 0.6);
+        }
+        
+        if (barHeight > 0) {
+          const radius = Math.min(2, barWidth / 2, barHeight / 2);
+          // Draw rounded top rectangle
+          cr.moveTo(x, chartHeight);
+          cr.lineTo(x, y + radius);
+          cr.arc(x + radius, y + radius, radius, Math.PI, -Math.PI / 2);
+          cr.lineTo(x + barWidth - radius, y);
+          cr.arc(x + barWidth - radius, y + radius, radius, -Math.PI / 2, 0);
+          cr.lineTo(x + barWidth, chartHeight);
+          cr.closePath();
+          cr.fill();
+        }
+        
+        x += barWidth + spacing;
+      });
+    }
+    
+    _updateStatsUI() {
+      if (this._todayTimeLabel) {
+        this._todayTimeLabel.text = this._formatFocusTime(this._getTodayFocusTimeWithCurrent());
+      }
+      this._updateChart();
     }
 
     _updateUIAfterRestore() {
@@ -346,6 +666,11 @@ const PomodoroIndicator = GObject.registerClass(
       this._isRunning = true;
       this._startStopItem.label.text = "Pause";
 
+      // Track when work session starts for real focus time
+      if (this._isWorkTime && !this._workSessionStartTime) {
+        this._workSessionStartTime = Date.now();
+      }
+
       if (this._timeout) {
         GLib.source_remove(this._timeout);
         this._timeout = null;
@@ -359,6 +684,12 @@ const PomodoroIndicator = GObject.registerClass(
             emoji = this._isLongBreak ? "☕" : "🌟";
           }
           this._label.text = `${emoji} ${this._formatTime(this._timeLeft)}`;
+          
+          // Update today's focus time in real-time during work
+          if (this._isWorkTime && this._todayTimeLabel) {
+            this._todayTimeLabel.text = this._formatFocusTime(this._getTodayFocusTimeWithCurrent());
+          }
+          
           return GLib.SOURCE_CONTINUE;
         } else {
           this._onTimerComplete();
@@ -370,6 +701,15 @@ const PomodoroIndicator = GObject.registerClass(
     _stopTimer() {
       this._isRunning = false;
       this._startStopItem.label.text = "Start";
+
+      // Record real focus time when stopping during work time
+      if (this._isWorkTime && this._workSessionStartTime) {
+        const elapsedSeconds = Math.floor((Date.now() - this._workSessionStartTime) / 1000);
+        if (elapsedSeconds > 0) {
+          this._recordFocusTime(elapsedSeconds);
+        }
+        this._workSessionStartTime = null;
+      }
 
       if (this._timeout) {
         GLib.source_remove(this._timeout);
@@ -403,6 +743,15 @@ const PomodoroIndicator = GObject.registerClass(
       this._timeout = null;
 
       if (this._isWorkTime) {
+        // Record the real elapsed work session focus time
+        if (this._workSessionStartTime) {
+          const elapsedSeconds = Math.floor((Date.now() - this._workSessionStartTime) / 1000);
+          if (elapsedSeconds > 0) {
+            this._recordFocusTime(elapsedSeconds);
+          }
+          this._workSessionStartTime = null;
+        }
+        
         this._pomodoroCount++;
 
         // Determine break length

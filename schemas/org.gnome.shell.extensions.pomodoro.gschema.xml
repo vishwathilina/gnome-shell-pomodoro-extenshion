@@ -36,5 +36,10 @@
       <summary>Enable sound effects</summary>
       <description>Play sound effects when transitioning between phases</description>
     </key>
+    <key type="s" name="focus-statistics">
+      <default>'{}'</default>
+      <summary>Focus statistics data</summary>
+      <description>JSON string storing daily focus time records (date: seconds)</description>
+    </key>
   </schema>
 </schemalist>
